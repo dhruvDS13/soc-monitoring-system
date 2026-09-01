@@ -1,4 +1,5 @@
 # SOC Security Log Monitoring & Threat Detection 
+> **🚀 Live Demo:** [Open SOC Monitoring Dashboard](https://soc-monitoring-system-nttkgcafub4mkazq3e6ejr.streamlit.app/)
 
 An end-to-end, portfolio-ready Security Operations Center (SOC) project that ingests authentication and web server logs, normalizes them into SQLite, applies explainable rule-based threat detection, enriches source IPs with a lightweight reputation score, and presents the results in an interactive Streamlit dashboard.
 
