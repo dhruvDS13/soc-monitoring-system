@@ -20,6 +20,7 @@ Usage:
 import os
 import sqlite3
 import pandas as pd
+import argparse
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE, "soc.db")
@@ -80,8 +81,15 @@ def add_alert(detected_at, rule_name, severity, source_ip, affected_user, affect
     })
 
 
-def load_events(conn):
-    df = pd.read_sql_query("SELECT * FROM logs_normalized", conn, parse_dates=["event_timestamp"])
+def load_events(conn, since_minutes=None):
+    if since_minutes:
+        cutoff = (pd.Timestamp.now().floor("s") - pd.Timedelta(minutes=since_minutes)).strftime("%Y-%m-%d %H:%M:%S")
+        df = pd.read_sql_query(
+            "SELECT * FROM logs_normalized WHERE event_timestamp >= ?",
+            conn, params=(cutoff,), parse_dates=["event_timestamp"]
+        )
+    else:
+        df = pd.read_sql_query("SELECT * FROM logs_normalized", conn, parse_dates=["event_timestamp"])
     return df
 
 
@@ -94,9 +102,11 @@ def rule_brute_force(df):
         grp = grp.reset_index(drop=True)
         times = grp["event_timestamp"].tolist()
         i = 0
+        j = 0
         n = len(times)
         while i < n:
-            j = i
+            if j < i:
+                j = i
             while j < n and (times[j] - times[i]).total_seconds() <= BRUTE_FORCE_WINDOW_MIN * 60:
                 j += 1
             count = j - i
@@ -140,9 +150,10 @@ def rule_password_spray(df):
     for ip, grp in auth.groupby("source_ip"):
         grp = grp.reset_index(drop=True)
         times = grp["event_timestamp"].tolist()
-        i, n = 0, len(grp)
+        i, j, n = 0, 0, len(grp)
         while i < n:
-            j = i
+            if j < i:
+                j = i
             while j < n and (times[j] - times[i]).total_seconds() <= SPRAY_WINDOW_MIN * 60:
                 j += 1
             window = grp.iloc[i:j]
@@ -182,9 +193,10 @@ def rule_web_credential_stuffing(df):
     for ip, grp in web.groupby("source_ip"):
         grp = grp.reset_index(drop=True)
         times = grp["event_timestamp"].tolist()
-        i, n = 0, len(grp)
+        i, j, n = 0, 0, len(grp)
         while i < n:
-            j = i
+            if j < i:
+                j = i
             while j < n and (times[j] - times[i]).total_seconds() <= WEB_CRED_STUFF_WINDOW_MIN * 60:
                 j += 1
             count = j - i
@@ -318,9 +330,10 @@ def rule_high_frequency_requests(df):
     for ip, grp in web.groupby("source_ip"):
         grp = grp.reset_index(drop=True)
         times = grp["event_timestamp"].tolist()
-        i, n = 0, len(grp)
+        i, j, n = 0, 0, len(grp)
         while i < n:
-            j = i
+            if j < i:
+                j = i
             while j < n and (times[j] - times[i]).total_seconds() <= HIGH_FREQ_WINDOW_MIN * 60:
                 j += 1
             count = j - i
@@ -357,38 +370,46 @@ def rule_recon_scanning(df):
     for ip, grp in web.groupby("source_ip"):
         grp = grp.reset_index(drop=True)
         times = grp["event_timestamp"].tolist()
-        i, n = 0, len(grp)
-        while i < n:
-            j = i
-            while j < n and (times[j] - times[i]).total_seconds() <= RECON_WINDOW_MIN * 60:
-                j += 1
-            window = grp.iloc[i:j]
-            distinct_paths = window["url_path"].nunique()
-            error_ratio = (window["response_code"].astype(str).str[0].isin(["4", "5"])).mean()
-            if distinct_paths >= RECON_MIN_DISTINCT_PATHS and error_ratio >= RECON_MIN_ERROR_RATIO:
-                sev = "High" if distinct_paths >= 15 else "Medium"
-                add_alert(
-                    detected_at=window["event_timestamp"].max().strftime("%d-%m-%Y %H:%M:%S"),
-                    rule_name="RECON_SCANNING",
-                    severity=sev,
-                    source_ip=ip,
-                    affected_user=None,
-                    affected_system="web-srv01",
-                    event_count=len(window),
-                    window_start=window["event_timestamp"].min().strftime("%d-%m-%Y %H:%M:%S"),
-                    window_end=window["event_timestamp"].max().strftime("%d-%m-%Y %H:%M:%S"),
-                    reason=(f"{ip} requested {distinct_paths} distinct URL paths within "
-                            f"{RECON_WINDOW_MIN} minutes with a {error_ratio:.0%} error rate "
-                            "(4xx/5xx) - consistent with vulnerability scanning/path enumeration "
-                            "(e.g. probing for .env, wp-login.php, admin panels)."),
-                    action=("Block source IP at WAF/firewall, review targeted paths for any "
-                            "that returned 200 (may indicate a real exposure), check for follow-up "
-                            "exploitation attempts from same IP/subnet."),
-                    evidence_ids=window["event_id"].tolist(),
-                )
-                i = j
-            else:
-                i += 1
+        paths = grp["url_path"].tolist()
+        n = len(grp)
+        left = 0
+        counts = {}
+        for right in range(n):
+            path = paths[right]
+            counts[path] = counts.get(path, 0) + 1
+            while left <= right and (times[right] - times[left]).total_seconds() > RECON_WINDOW_MIN * 60:
+                old = paths[left]
+                counts[old] -= 1
+                if counts[old] == 0:
+                    del counts[old]
+                left += 1
+            distinct_paths = len(counts)
+            if distinct_paths >= RECON_MIN_DISTINCT_PATHS:
+                window = grp.iloc[left:right + 1]
+                error_ratio = (window["response_code"].astype(str).str[0].isin(["4", "5"])).mean()
+                if error_ratio >= RECON_MIN_ERROR_RATIO:
+                    sev = "High" if distinct_paths >= 15 else "Medium"
+                    add_alert(
+                        detected_at=window["event_timestamp"].max().strftime("%d-%m-%Y %H:%M:%S"),
+                        rule_name="RECON_SCANNING",
+                        severity=sev,
+                        source_ip=ip,
+                        affected_user=None,
+                        affected_system="web-srv01",
+                        event_count=len(window),
+                        window_start=window["event_timestamp"].min().strftime("%d-%m-%Y %H:%M:%S"),
+                        window_end=window["event_timestamp"].max().strftime("%d-%m-%Y %H:%M:%S"),
+                        reason=(f"{ip} requested {distinct_paths} distinct URL paths within "
+                                f"{RECON_WINDOW_MIN} minutes with a {error_ratio:.0%} error rate "
+                                "(4xx/5xx) - consistent with vulnerability scanning/path enumeration "
+                                "(e.g. probing for .env, wp-login.php, admin panels)."),
+                        action=("Block source IP at WAF/firewall, review targeted paths for any "
+                                "that returned 200 (may indicate a real exposure), check for follow-up "
+                                "exploitation attempts from same IP/subnet."),
+                        evidence_ids=window["event_id"].tolist(),
+                    )
+                    left = right + 1
+                    counts = {}
 
 
 # ---------------------------------------------------------------------------
@@ -400,9 +421,10 @@ def rule_repeated_failed_login_user(df):
     for user, grp in auth.groupby("username"):
         grp = grp.reset_index(drop=True)
         times = grp["event_timestamp"].tolist()
-        i, n = 0, len(grp)
+        i, j, n = 0, 0, len(grp)
         while i < n:
-            j = i
+            if j < i:
+                j = i
             while j < n and (times[j] - times[i]).total_seconds() <= FAILED_LOGIN_USER_WINDOW_MIN * 60:
                 j += 1
             count = j - i
@@ -434,8 +456,8 @@ def rule_repeated_failed_login_user(df):
                 i += 1
 
 
-def run_all_rules(conn):
-    df = load_events(conn)
+def run_all_rules(conn, since_minutes=None):
+    df = load_events(conn, since_minutes=since_minutes)
     rule_brute_force(df)
     rule_password_spray(df)
     rule_web_credential_stuffing(df)
@@ -447,23 +469,40 @@ def run_all_rules(conn):
     rule_repeated_failed_login_user(df)
 
 
-def save_alerts(conn):
-    conn.execute("DELETE FROM alerts")
+def save_alerts(conn, append=False):
+    if not append:
+        conn.execute("DELETE FROM alerts")
     cols = ["detected_at", "rule_name", "severity", "source_ip", "affected_user",
             "affected_system", "event_count", "window_start", "window_end",
             "detection_reason", "recommended_action", "evidence_event_ids"]
     placeholders = ",".join(["?"] * len(cols))
     sql = f"INSERT INTO alerts ({','.join(cols)}) VALUES ({placeholders})"
     values = [[a.get(c) for c in cols] for a in alerts_buffer]
-    conn.executemany(sql, values)
+    if append:
+        existing = {
+            (r[0], r[1], r[2], r[3], r[4])
+            for r in conn.execute("SELECT rule_name, severity, source_ip, affected_user, window_start FROM alerts")
+        }
+        new_values = []
+        for row in values:
+            key = (row[1], row[2], row[3], row[4], row[7])
+            if key not in existing:
+                new_values.append(row)
+        conn.executemany(sql, new_values)
+    else:
+        conn.executemany(sql, values)
     conn.commit()
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--recent-minutes", type=int, default=None, help="Only inspect recent events for live mode")
+    parser.add_argument("--append", action="store_true", help="Keep existing alerts and append new detections")
+    args = parser.parse_args()
     conn = sqlite3.connect(DB_PATH)
-    run_all_rules(conn)
-    save_alerts(conn)
-    print(f"Generated {len(alerts_buffer)} alerts")
+    run_all_rules(conn, since_minutes=args.recent_minutes)
+    save_alerts(conn, append=args.append)
+    print(f"Generated {len(alerts_buffer)} candidate alerts")
     sev_counts = pd.Series([a["severity"] for a in alerts_buffer]).value_counts()
     print(sev_counts)
     conn.close()

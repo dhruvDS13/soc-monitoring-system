@@ -11,12 +11,15 @@ If soc.db doesn't exist yet, run the pipeline first:
     python3 src/parse_logs.py
     python3 src/detection_rules.py
 """
-
 import os
 import sqlite3
+import subprocess
+import sys
+
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+from streamlit_autorefresh import st_autorefresh
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE, "soc.db")
@@ -32,7 +35,7 @@ SEVERITY_COLORS = {
 SEVERITY_ORDER = ["Critical", "High", "Medium", "Low"]
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=2)
 def load_data():
     conn = sqlite3.connect(DB_PATH)
     logs = pd.read_sql_query("SELECT * FROM logs_normalized", conn, parse_dates=["event_timestamp"])
@@ -40,7 +43,40 @@ def load_data():
     ip_rep = pd.read_sql_query("SELECT * FROM ip_reputation", conn)
     conn.close()
     return logs, alerts, ip_rep
+# ---------------------------------------------------------------------------
+# Live simulator control
+# ---------------------------------------------------------------------------
+SIMULATOR_SCRIPT = os.path.join(BASE, "src", "live_simulator.py")
 
+
+def start_live_simulator():
+    """Start the live simulator once for this Streamlit session."""
+    if not os.path.exists(SIMULATOR_SCRIPT):
+        return None
+
+    if "simulator_process" not in st.session_state:
+        try:
+            process = subprocess.Popen(
+                [sys.executable, SIMULATOR_SCRIPT],
+                cwd=BASE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            st.session_state.simulator_process = process
+        except Exception:
+            st.session_state.simulator_process = None
+
+    return st.session_state.get("simulator_process")
+
+
+def stop_live_simulator():
+    """Stop the simulator when Live Mode is disabled."""
+    process = st.session_state.get("simulator_process")
+
+    if process is not None and process.poll() is None:
+        process.terminate()
+
+    st.session_state.simulator_process = None
 
 if not os.path.exists(DB_PATH):
     st.error(
@@ -55,18 +91,40 @@ logs, alerts, ip_rep = load_data()
 # ---------------------------------------------------------------------------
 # Sidebar filters
 # ---------------------------------------------------------------------------
-st.sidebar.title("🛡️ SOC Dashboard Filters")
+#st.sidebar.title("🛡️ SOC Dashboard Filters")
+#live_mode = st.sidebar.toggle("🟢 Live Mode", value=True)
+#if live_mode:
+#    st_autorefresh(interval=5000, key="soc_live_refresh")
+#    st.sidebar.caption("Refreshing every 5 seconds")
+
+
+live_mode = st.sidebar.toggle("🟢 Live Mode", value=True)
+
+if live_mode:
+    simulator = start_live_simulator()
+
+    st_autorefresh(
+        interval=5000,
+        key="soc_live_refresh"
+    )
+
+    st.sidebar.success("Live simulator running")
+    st.sidebar.caption("New events are being generated automatically.")
+else:
+    stop_live_simulator()
+    st.sidebar.info("Live Mode is OFF")    
+    
+    
+    
+    
 min_d, max_d = logs["event_timestamp"].min().date(), logs["event_timestamp"].max().date()
-date_range = st.sidebar.date_input("Date range", (min_d, max_d), min_value=min_d, max_value=max_d)
+date_range = st.sidebar.date_input("Date range", (min_d, max_d), min_value=min_d, max_value=max_d, format="DD/MM/YYYY")
 sev_filter = st.sidebar.multiselect("Severity", SEVERITY_ORDER, default=SEVERITY_ORDER)
 rule_filter = st.sidebar.multiselect(
     "Detection rule", sorted(alerts["rule_name"].unique()), default=sorted(alerts["rule_name"].unique())
 )
 st.sidebar.markdown("---")
-st.sidebar.caption(
-    "Dataset: synthetic SSH auth log + web access log, 6 simulated days, "
-    "6 injected attack scenarios. See README.md for details."
-)
+st.sidebar.caption("Dataset: 1–5 years historical synthetic security events + optional near-real-time simulator.\n\nLive data is simulated because this portfolio project has no production log source.")
 
 if isinstance(date_range, tuple) and len(date_range) == 2:
     start_d, end_d = date_range
@@ -118,9 +176,10 @@ with c1:
 with c2:
     st.subheader("Attack Trend Over Time")
     trend = alerts_f.copy()
-    trend["day"] = trend["detected_at"].dt.date
-    trend_counts = trend.groupby(["day", "severity"]).size().reset_index(name="count")
-    fig2 = px.bar(trend_counts, x="day", y="count", color="severity",
+    range_days = (end_d - start_d).days
+    trend["period"] = trend["detected_at"].dt.to_period("D").dt.start_time if range_days <= 90 else trend["detected_at"].dt.to_period("M").dt.start_time
+    trend_counts = trend.groupby(["period", "severity"]).size().reset_index(name="count")
+    fig2 = px.bar(trend_counts, x="period", y="count", color="severity",
                   color_discrete_map=SEVERITY_COLORS, category_orders={"severity": SEVERITY_ORDER},
                   barmode="stack")
     fig2.update_layout(height=350)
@@ -217,7 +276,4 @@ else:
     st.info("No alerts match the current filters.")
 
 st.markdown("---")
-st.caption(
-    "⚠️ This dashboard runs on synthetic data for demonstration/portfolio purposes. "
-    "See README.md for methodology, limitations, and how to point this pipeline at real log sources."
-)
+st.caption("⚠️ Portfolio mode: historical data is synthetic and Live Mode uses a local event simulator. Replace the simulator with an authorized production log source when available.")

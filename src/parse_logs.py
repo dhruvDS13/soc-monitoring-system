@@ -21,7 +21,8 @@ WEB_LOG = os.path.join(BASE, "data", "raw_logs", "web_access.log")
 DB_PATH = os.path.join(BASE, "soc.db")
 SCHEMA_PATH = os.path.join(BASE, "sql", "schema.sql")
 
-YEAR_ASSUMED = 2025  # syslog auth.log lines have no year field
+HISTORY_YEARS = max(1, min(5, int(os.getenv("HISTORY_YEARS", "5"))))
+YEAR_ASSUMED = datetime.now().year - HISTORY_YEARS  # starting year for generated syslog history
 
 # ---------------------------------------------------------------------------
 # Regex patterns
@@ -45,6 +46,8 @@ WEB_RE = re.compile(
 
 def parse_auth_log(path):
     rows = []
+    current_year = YEAR_ASSUMED
+    previous_month_day = None
     with open(path, "r") as f:
         for line in f:
             line = line.strip()
@@ -54,8 +57,13 @@ def parse_auth_log(path):
             if not m:
                 continue
             gd = m.groupdict()
+            month_num = {m:i for i,m in enumerate(("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"), 1)}
+            md_tuple = (month_num[gd["month"]], int(gd["day"]))
+            if previous_month_day is not None and md_tuple < previous_month_day:
+                current_year += 1
+            previous_month_day = md_tuple
             ts = datetime.strptime(
-                f"{YEAR_ASSUMED} {gd['month']} {gd['day']} {gd['time']}", "%Y %b %d %H:%M:%S"
+                f"{current_year} {gd['month']} {gd['day']} {gd['time']}", "%Y %b %d %H:%M:%S"
             )
             invalid_user = "invalid user" in line
             success = gd["result"] == "Accepted"

@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+
+.venv/
+venv/
+.env
+.streamlit/secrets.toml
+
+data/raw_logs/
+
+soc.db-shm
+soc.db-wal
+
+run_file.txt
+soc guide file.docx
+SOC_Project_Complete_Explanation_and_Interview_Guide.docx
